@@ -393,3 +393,68 @@ func TestRuleGroupUpdatedOnlyWhenReferencedSetsChange(t *testing.T) {
 		})
 	}
 }
+
+func TestRulesUseConfiguredVisibility(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		enabled       bool
+		wantRuleGroup visibility
+		wantACL       visibility
+	}{
+		{
+			name:          "metrics disabled",
+			enabled:       false,
+			wantRuleGroup: visibility{CloudWatchMetricsEnabled: false, SampledRequestsEnabled: false, MetricName: "crowdsec-metric-ban"},
+			wantACL:       visibility{CloudWatchMetricsEnabled: false, SampledRequestsEnabled: false, MetricName: "crowdsec-metric"},
+		},
+		{
+			name:          "metrics enabled",
+			enabled:       true,
+			wantRuleGroup: visibility{CloudWatchMetricsEnabled: true, SampledRequestsEnabled: true, MetricName: "crowdsec-metric-ban"},
+			wantACL:       visibility{CloudWatchMetricsEnabled: true, SampledRequestsEnabled: true, MetricName: "crowdsec-metric"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f, client := newFakeWAF(t)
+			w := newTestWAF(client, committedSet(client, "IPV4", "set-1", "192.0.2.1"))
+			w.visibilityConfig = &wafv2types.VisibilityConfig{
+				CloudWatchMetricsEnabled: tc.enabled,
+				SampledRequestsEnabled:   tc.enabled,
+				MetricName:               aws.String("crowdsec-metric"),
+			}
+
+			if err := w.UpdateSetsContent(t.Context(), Decisions{}); err != nil {
+				t.Fatalf("UpdateSetsContent: %s", err)
+			}
+
+			acl := &wafv2types.WebACL{
+				Name:          aws.String("test-acl"),
+				Id:            aws.String("acl-id"),
+				ARN:           aws.String("arn:acl"),
+				DefaultAction: &wafv2types.DefaultAction{Allow: &wafv2types.AllowAction{}},
+				VisibilityConfig: &wafv2types.VisibilityConfig{
+					CloudWatchMetricsEnabled: true,
+					SampledRequestsEnabled:   true,
+					MetricName:               aws.String("test-acl"),
+				},
+			}
+			if err := w.AddRuleGroupToACL(t.Context(), acl, aws.String("lock")); err != nil {
+				t.Fatalf("AddRuleGroupToACL: %s", err)
+			}
+
+			if got := findRule(t, f.calls("UpdateRuleGroup")[0], "crowdsec-rule-ban").VisibilityConfig; got != tc.wantRuleGroup {
+				t.Errorf("rule group rule visibility = %+v, want %+v", got, tc.wantRuleGroup)
+			}
+
+			if got := findRule(t, f.calls("UpdateWebACL")[0], testRuleGroup).VisibilityConfig; got != tc.wantACL {
+				t.Errorf("web ACL rule visibility = %+v, want %+v", got, tc.wantACL)
+			}
+		})
+	}
+}

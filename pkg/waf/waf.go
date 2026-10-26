@@ -210,9 +210,9 @@ func (w *WAF) UpdateRuleGroup(ctx context.Context) error {
 				Statement: statement,
 				Priority:  priority,
 				VisibilityConfig: &wafv2types.VisibilityConfig{
-					SampledRequestsEnabled:   false,
-					CloudWatchMetricsEnabled: false,
-					MetricName:               aws.String(w.config.RuleGroupName),
+					SampledRequestsEnabled:   w.visibilityConfig.SampledRequestsEnabled,
+					CloudWatchMetricsEnabled: w.visibilityConfig.CloudWatchMetricsEnabled,
+					MetricName:               aws.String(fmt.Sprintf("%s-%s", *w.visibilityConfig.MetricName, actionType)),
 				},
 			}
 			priority++
@@ -348,13 +348,9 @@ func (w *WAF) AddRuleGroupToACL(ctx context.Context, acl *wafv2types.WebACL, tok
 	w.Logger.Infof("Adding RuleGroup %s to ACL %s", w.config.RuleGroupName, *acl.Name)
 
 	rule := wafv2types.Rule{
-		Name:     aws.String(w.config.RuleGroupName),
-		Priority: w.getPriority(acl),
-		VisibilityConfig: &wafv2types.VisibilityConfig{
-			CloudWatchMetricsEnabled: false,
-			MetricName:               aws.String(w.config.RuleGroupName),
-			SampledRequestsEnabled:   false,
-		},
+		Name:             aws.String(w.config.RuleGroupName),
+		Priority:         w.getPriority(acl),
+		VisibilityConfig: w.visibilityConfig,
 		Statement: &wafv2types.Statement{
 			RuleGroupReferenceStatement: &wafv2types.RuleGroupReferenceStatement{
 				ARN: aws.String(w.ruleGroupsInfos[w.config.RuleGroupName].ARN),
