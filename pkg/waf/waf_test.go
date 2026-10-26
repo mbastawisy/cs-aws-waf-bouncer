@@ -205,6 +205,15 @@ func committedSet(client *wafv2.Client, ipType string, id string, ips ...string)
 	return s
 }
 
+func fullSet(client *wafv2.Client, id string) *WAFIpSet {
+	ips := make([]string, 0, 10000)
+	for i := range 10000 {
+		ips = append(ips, fmt.Sprintf("10.0.%d.%d", i/256, i%256))
+	}
+
+	return committedSet(client, "IPV4", id, ips...)
+}
+
 func newTestWAF(client *wafv2.Client, sets ...*WAFIpSet) *WAF {
 	logger := log.WithField("acl", "test-acl")
 	manager := NewIPSetManager("crowdsec-ipset", "CLOUDFRONT", client, logger)
@@ -227,7 +236,38 @@ func newTestWAF(client *wafv2.Client, sets ...*WAFIpSet) *WAF {
 	}
 }
 
+func findRule(t *testing.T, body requestBody, name string) ruleBody {
+	t.Helper()
+
+	for _, rule := range body.Rules {
+		if rule.Name == name {
+			return rule
+		}
+	}
+
+	t.Fatalf("no rule %q in %+v", name, body.Rules)
+
+	return ruleBody{}
+}
+
 // referencedARNs returns the IP set ARNs a rule's statement references.
+func referencedARNs(rule ruleBody) []string {
+	statements := []statementBody{rule.Statement}
+	if rule.Statement.OrStatement != nil {
+		statements = rule.Statement.OrStatement.Statements
+	}
+
+	var arns []string
+
+	for _, s := range statements {
+		if s.IPSetReferenceStatement != nil {
+			arns = append(arns, s.IPSetReferenceStatement.ARN)
+		}
+	}
+
+	return arns
+}
+
 func TestUnbanUpdatesOnlyTheSetHoldingTheIP(t *testing.T) {
 	t.Parallel()
 
@@ -257,5 +297,99 @@ func TestUnbanUpdatesOnlyTheSetHoldingTheIP(t *testing.T) {
 
 	if got, want := updates[0].Addresses, []string{"192.0.2.3"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("UpdateIPSet Addresses = %v, want %v", got, want)
+	}
+}
+
+func TestRuleGroupUpdatedOnlyWhenReferencedSetsChange(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		sets          func(client *wafv2.Client) []*WAFIpSet
+		failFirstSync bool
+		next          Decisions
+		wantWrites    int
+		wantARNs      []string
+	}{
+		{
+			name: "membership change only",
+			sets: func(client *wafv2.Client) []*WAFIpSet {
+				return []*WAFIpSet{
+					committedSet(client, "IPV4", "set-1", "192.0.2.1"),
+					committedSet(client, "IPV4", "set-2", "192.0.2.2", "192.0.2.3"),
+				}
+			},
+			next: Decisions{
+				V4Add: map[string][]*string{"ban": {aws.String("192.0.2.9")}},
+				V4Del: map[string][]*string{"ban": {aws.String("192.0.2.2")}},
+			},
+			wantWrites: 1,
+			wantARNs:   []string{"arn:set-1", "arn:set-2"},
+		},
+		{
+			name: "new set created",
+			sets: func(client *wafv2.Client) []*WAFIpSet {
+				return []*WAFIpSet{fullSet(client, "set-1")}
+			},
+			next: Decisions{
+				V4Add: map[string][]*string{"ban": {aws.String("192.0.2.9")}},
+			},
+			wantWrites: 2,
+			wantARNs:   []string{"arn:set-1", "arn:new-1"},
+		},
+		{
+			name: "set emptied",
+			sets: func(client *wafv2.Client) []*WAFIpSet {
+				return []*WAFIpSet{
+					committedSet(client, "IPV4", "set-1", "192.0.2.1"),
+					committedSet(client, "IPV4", "set-2", "192.0.2.2"),
+				}
+			},
+			next: Decisions{
+				V4Del: map[string][]*string{"ban": {aws.String("192.0.2.2")}},
+			},
+			wantWrites: 2,
+			wantARNs:   []string{"arn:set-1"},
+		},
+		{
+			name: "previous write failed",
+			sets: func(client *wafv2.Client) []*WAFIpSet {
+				return []*WAFIpSet{committedSet(client, "IPV4", "set-1", "192.0.2.1")}
+			},
+			failFirstSync: true,
+			wantWrites:    2,
+			wantARNs:      []string{"arn:set-1"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f, client := newFakeWAF(t)
+			w := newTestWAF(client, tc.sets(client)...)
+
+			if tc.failFirstSync {
+				f.failNext["UpdateRuleGroup"] = 1
+			}
+
+			if err := w.UpdateSetsContent(t.Context(), Decisions{}); err != nil && !tc.failFirstSync {
+				t.Fatalf("first UpdateSetsContent: %s", err)
+			}
+
+			if err := w.UpdateSetsContent(t.Context(), tc.next); err != nil {
+				t.Fatalf("second UpdateSetsContent: %s", err)
+			}
+
+			writes := f.calls("UpdateRuleGroup")
+			if len(writes) != tc.wantWrites {
+				t.Fatalf("UpdateRuleGroup calls = %d, want %d", len(writes), tc.wantWrites)
+			}
+
+			rule := findRule(t, writes[len(writes)-1], "crowdsec-rule-ban")
+			if got := referencedARNs(rule); !reflect.DeepEqual(got, tc.wantARNs) {
+				t.Errorf("last UpdateRuleGroup references %v, want %v", got, tc.wantARNs)
+			}
+		})
 	}
 }
